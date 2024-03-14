@@ -53,7 +53,7 @@ from accelerate import init_empty_weights
 from accelerate.utils import set_seed
 from peft import get_peft_model, LoraConfig, TaskType
 from transformers.utils import hub, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM, AutoConfig
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from fastcore.parallel import parallel
 
@@ -489,7 +489,6 @@ class LORA(nn.Module):
         return result
 
 
-
 # Main function, run on each process
 def fsdp_main(local_rank:int, world_size:int, args:Dict):
     print_func = tqdm.write if args["log_to"] == 'tqdm' else print
@@ -504,6 +503,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         rank = local_rank
 
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
     torch.cuda.set_device(local_rank)
 
     # Start logging
@@ -553,12 +553,20 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     print("Creating model", rank)
     if args["train_type"] in ["full", "lora", "custom_lora"]:
         if (args["low_memory"] and rank == 0) or (not args["low_memory"]):
-            model = AutoModelForCausalLM.from_pretrained(
-                args["model_name"],
-                use_cache=False,
-                torch_dtype=torch_dtype,
-                _attn_implementation=attn_impl
-            )
+            if args["model_type"] == "masked":
+                model = AutoModelForMaskedLM.from_pretrained(
+                    args["model_name"],
+                    use_cache=False,
+                    torch_dtype=torch_dtype,
+                    _attn_implementation=attn_impl
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    args["model_name"],
+                    use_cache=False,
+                    torch_dtype=torch_dtype,
+                    _attn_implementation=attn_impl
+                )
             dtype = torch_dtype if args["precision"] == "bf16" else None
             model.to(dtype=dtype, device="cpu" if args["low_memory"] else rank)
         else:
@@ -566,7 +574,10 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             cfg.use_cache = False
             cfg._attn_implementation = attn_impl
             with init_empty_weights():
-                model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch_dtype)
+                if args["model_type"] == "masked":
+                    model = AutoModelForMaskedLM.from_config(cfg, torch_dtype=torch_dtype)
+                else:
+                    model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch_dtype)
             if args["precision"] == "bf16":
                 model.to(torch_dtype)
     elif args["train_type"] in ["qlora", "custom_qlora", "hqq_lora"]: # Our custom loading
@@ -576,7 +587,10 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
         # load model on meta device without calling init and replace nn.Linear with Linear4bit
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(cfg)
+            if model_type == "masked":
+                model = AutoModelForMaskedLM.from_config(cfg)
+            else:
+                model = AutoModelForCausalLM.from_config(cfg)
             if args["train_type"] in ["hqq_lora"]:
                 # TODO: Tune BaseQuantizeConfig.
                 quant_config = BaseQuantizeConfig(nbits=4, group_size=64, quant_zero=True,
@@ -953,6 +967,7 @@ def main(
     no_sync: bool_arg = False, # Prevent gradient sync until update step. Likely uses more memory. Required for `use_cpu_offload` and `gradient_accumulation_steps > 1`
     precision: Param("", choices=["fp32", "bf16", "fp16_autocast", "bf16_autocast", "bf16_buffers_autocast"]) = "bf16", # Training precision. autocast precisions use mixed precision
     model_name: str = "meta-llama/Llama-2-7b-hf", # Which model to train - e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    model_type: str = "causal", # Model type to load. e.g. "causal" or "masked"
     save_model: bool_arg = False, # Save the resulting model
     output_dir: str = "output", # Output directory to save the final model to
     lora_rank: int = 64, # LoRA rank for lora/qlora
