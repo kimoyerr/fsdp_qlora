@@ -25,6 +25,7 @@ from contextlib import nullcontext
 from safetensors.torch import save_file
 from tqdm.auto import tqdm
 from typing import List, Dict
+import pandas as pd
 
 # Argument parsing
 from fastcore.script import call_parse, bool_arg, Param
@@ -52,6 +53,7 @@ from bitsandbytes.nn import Linear4bit, Params4bit
 from accelerate import init_empty_weights
 from accelerate.utils import set_seed
 from peft import get_peft_model, LoraConfig, TaskType
+from peft.utils.other import fsdp_auto_wrap_policy
 from transformers.utils import hub, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM, AutoConfig
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
@@ -96,6 +98,7 @@ class Logger:
             wandb.log(d)
         elif self.log_to == "stdout":
             for k,v in d.items():
+                print(k)
                 print(f'{k}: {v}')
 
     def finish(self, rank=0):
@@ -354,6 +357,34 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
 
     return dataloader
 
+def get_confit_dataloader(args:Dict):
+
+    from transformers import EsmForMaskedLM, EsmTokenizer
+    from confit.data_utils import Mutation_Set
+
+    train_csv = pd.DataFrame(None)
+    data_dir = "/ConFit/data"
+    dataset_name = "ENVZ_ECOLI_Ghose_2023"
+    model_seed = 1
+    test_csv = pd.read_csv(f"{data_dir}/{dataset_name}/test.csv")
+    for i in range(1, 6):
+        if i == model_seed:
+            val_csv = pd.read_csv(f"{data_dir}/{dataset_name}/train_{i}.csv")   #using 1/5 train data as validation set
+        temp_csv = pd.read_csv(f"{data_dir}/{dataset_name}/train_{i}.csv")
+        train_csv = pd.concat([train_csv, temp_csv], axis=0)
+    
+    tokenizer = EsmTokenizer.from_pretrained(f'facebook/esm1v_t33_650M_UR90S_{model_seed}')
+    trainset = Mutation_Set(data=train_csv, fname=dataset_name, tokenizer=tokenizer)
+    print(len(trainset))
+
+    # For distributed training, use DistributedSampler
+    sampler = DistributedSampler(trainset, seed=args["seed"])
+
+    # No collate function since trainset already has one
+    dataloader = DataLoader(trainset, batch_size=args["batch_size"], collate_fn=trainset.collate_fn, sampler=sampler)
+
+    return dataloader
+
 
 # LR scheduler.
 def _get_cosine_one_cycle_lr_lambda(
@@ -408,7 +439,7 @@ def get_optimizer(model:nn.Module, args:Dict):
 
 # Wrap the model using LoRA policy from llama-recipes or custom policy:
 # This checks for lora layers (has weight and requires_grad)
-def get_wrapping_policy(custom_policy:bool=False):
+def get_wrapping_policy(custom_policy:bool=False, transformer_layer_name="LlamaDecoderLayer"):
     if custom_policy:
         def lambda_policy_fn(module):
             # LORA trainable layers.
@@ -431,7 +462,7 @@ def get_wrapping_policy(custom_policy:bool=False):
     lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
     self_attn_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=self_attn_policy_fn)
     mlp_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=mlp_policy_fn)
-    transformer_layer_name = LlamaDecoderLayer
+    # transformer_layer_name = LlamaDecoderLayer
     transformer_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls=(
@@ -445,6 +476,46 @@ def get_wrapping_policy(custom_policy:bool=False):
     if custom_policy:
         policies.extend([self_attn_policy, mlp_policy])
     return functools.partial(_or_policy, policies=policies)
+
+
+# Copied from peft.utils.other and modified the exception when the transformer layer class could not be found to a warning
+def fsdp_auto_wrap_policy_confit(model):
+
+    from accelerate import FullyShardedDataParallelPlugin
+    from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
+
+    default_transformer_cls_names_to_wrap = (
+        ",".join(model._no_split_modules) if getattr(model, "_no_split_modules", None) is not None else ""
+    )
+    transformer_cls_names_to_wrap = os.environ.get(
+        "FSDP_TRANSFORMER_CLS_TO_WRAP", default_transformer_cls_names_to_wrap
+    ).split(",")
+    transformer_cls_to_wrap = {PrefixEncoder, PromptEncoder, PromptEmbedding}
+    for layer_class in transformer_cls_names_to_wrap:
+        transformer_cls = FullyShardedDataParallelPlugin.get_module_class_from_name(model, layer_class)
+        if transformer_cls is None:
+            # Add a warning here instead of raising an exception
+            print(f"Warning: Transformer layer class {layer_class} not found in model")
+        else:
+            transformer_cls_to_wrap.add(transformer_cls)
+
+    def lambda_policy_fn(module):
+        if (
+            len(list(module.named_children())) == 0
+            and getattr(module, "weight", None) is not None
+            and module.weight.requires_grad
+        ):
+            return True
+        return False
+
+    lambda_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=lambda_policy_fn)
+    transformer_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=transformer_cls_to_wrap,
+    )
+
+    auto_wrap_policy = functools.partial(_or_policy, policies=[lambda_policy, transformer_wrap_policy])
+    return auto_wrap_policy
 
 
 # Custom LORA module.
@@ -544,7 +615,10 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     tokenizer.pad_token_id = tokenizer.eos_token_id # TODO check if it exists first
 
     # Set up dataloader
-    dataloader = get_dataloader(tokenizer, args)
+    if args["dataset"]!="confit":
+        dataloader = get_dataloader(tokenizer, args)
+    else:
+        dataloader = get_confit_dataloader(args)
 
 
     # Create model
@@ -558,7 +632,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     args["model_name"],
                     use_cache=False,
                     torch_dtype=torch_dtype,
-                    _attn_implementation=attn_impl
+                    _attn_implementation="eager"
+
                 )
             else:
                 model = AutoModelForCausalLM.from_pretrained(
@@ -587,7 +662,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
         # load model on meta device without calling init and replace nn.Linear with Linear4bit
         with init_empty_weights():
-            if model_type == "masked":
+            if args["model_type"] == "masked":
                 model = AutoModelForMaskedLM.from_config(cfg)
             else:
                 model = AutoModelForCausalLM.from_config(cfg)
@@ -648,7 +723,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     # PEFT setup (LoRA and QLoRA)
     if args["train_type"] in ["lora", "qlora"]:
         peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM, inference_mode=False,
+            task_type=TaskType.CAUSAL_LM, 
+            inference_mode=False,
             r=args["lora_rank"],
             lora_alpha=args["lora_alpha"],
             lora_dropout=args["lora_dropout"],
@@ -689,7 +765,11 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
 
     # Wrap model with llama-recipies or custom LoRA policy
-    my_auto_wrap_policy = get_wrapping_policy(args["train_type"] in ["custom_qlora", "hqq_lora"])
+    if args["dataset"] == "confit":
+        my_auto_wrap_policy = fsdp_auto_wrap_policy_confit(model)
+    else:
+        my_auto_wrap_policy = get_wrapping_policy(args["train_type"] in ["custom_qlora", "hqq_lora"])
+
 
     print("Wrapping model w/ FSDP", rank)
     if args["sharding_strategy"] == "full_shard":
@@ -792,6 +872,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         model.train()
         ddp_loss = torch.zeros(2).to(local_rank)
 
+        total_loss = torch.zeros(1).to(local_rank)
+
         for batch_idx, batch in enumerate(dataloader):
             accumulate_grads = (batch_idx+1) % gradient_accumulation_steps == 0
 
@@ -813,15 +895,31 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
             # Forward pass
             with sync_context:
-                with autocast:
-                    output = model(
-                        batch['input_ids'].to(local_rank),
-                        labels=batch['labels'].to(local_rank),
-                        attention_mask=None,
-                    )
-                    loss = output.loss
+                if args["dataset"] == "confit":
+                    from confit.stat_utils import compute_score, BT_loss
+
+                    with autocast:
+                        seq, mask = batch[0], batch[1]
+                        wt, wt_mask = batch[2], batch[3]
+                        pos = batch[4]
+                        golden_score = batch[5]
+                        score, logits = compute_score(model, seq, mask, wt, pos, tokenizer)
+                        score = score.to(local_rank)
+
+                        # BT loss
+                        loss = BT_loss(score, golden_score)
+                        # print(loss, local_rank)
+                else:
+                    with autocast:
+                        output = model(
+                            batch['input_ids'].to(local_rank),
+                            labels=batch['labels'].to(local_rank),
+                            attention_mask=None,
+                        )
+                        loss = output.loss
 
                 # Scale loss for gradient accumulation
+                total_loss += loss.item()
                 loss = loss / gradient_accumulation_steps
 
                 # Log memory usage
@@ -835,7 +933,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     loss.backward()
 
             # Record loss
-            bs = batch['input_ids'].shape[0]
+            bs = batch[0].shape[0]
             ddp_loss[0] += loss.item() * bs * gradient_accumulation_steps
             ddp_loss[1] += bs
 
@@ -870,8 +968,11 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             # Log loss every gradient update steps
             if accumulate_grads:
                 dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+                # dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
                 if rank == 0:
                     log_loss = ddp_loss[0] / ddp_loss[1]
+                    print(ddp_loss)
+                    print(total_loss)
                     if lr_scheduler is not None:
                         log_lr = lr_scheduler.get_last_lr()[0]
                     else:
@@ -889,10 +990,15 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             if args["log_to"] == 'wandb':
                 logger.log({"memory_peak": peak_memory}, rank)
 
+        if rank == 0:
+            print(total_loss)
+        elif rank == 1:
+            print(total_loss)
     # Synchronize at the end and record time
     init_end_event.record()
     dist.barrier()
     torch.cuda.synchronize()
+    
 
     if rank == 0:
         print("Finished training", rank)
@@ -957,7 +1063,7 @@ def main(
     context_length: int = 512, # Max length of input sequence (in tokens)
     gradient_accumulation_steps: int = 1, # How many steps to accumulate gradients over (increases effective batch size)
     num_epochs: int = 1, # How many epochs of training to do
-    dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql"]) = "alpaca_sample", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
+    dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql", "confit"]) = "alpaca_sample", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
     sharding_strategy: Param("", choices=["full_shard", "shard_grad_op", "ddp", "hybrid_full_shard", "hybrid_shard_grad_op"]) = "full_shard", # Sharding strategy for FSDP
     use_gradient_checkpointing: bool_arg = True, # Use FSDP's activation checkpointing
     reentrant_checkpointing: bool_arg = False, # Use re-entrant autograd activation checkpointing. Setting to True can use less GPU memory with BNB QLoRA
@@ -973,7 +1079,7 @@ def main(
     lora_rank: int = 64, # LoRA rank for lora/qlora
     lora_alpha: int = 16, # LoRA alpha for lora/qlora
     lora_dropout: float = 0.1, # LoRA dropout for lora/qlora
-    lora_target_modules: Param("", choices=["all", "default"]) = "all", # If 'default', uses peft defaults. Use 'all' for our best guess for Llama models
+    lora_target_modules: str = "all", # If 'default', uses peft defaults. Use 'all' for our best guess for Llama models
     verbose: bool_arg = False, # Whether to print extra info for debugging
     lr: float = 1e-5, # Learning rate
     apply_gradient_clipping: bool_arg = False, # Apply gradient norm clipping
@@ -1008,6 +1114,9 @@ def main(
         args["lora_target_modules"] = ["k_proj", "q_proj", "v_proj", "up_proj", "down_proj", "gate_proj"]
     elif lora_target_modules.lower() == "default":
         args["lora_target_modules"] = None
+    else:
+        # Parse input string to list
+        args["lora_target_modules"] = args["lora_target_modules"].split(",")
 
     if args["precision"] in ["bf16", "bf16_autocast", "bf16_buffers_autocast"] and not torch.cuda.is_bf16_supported():
         raise ValueError('Current device does not support bfloat16')
@@ -1023,6 +1132,6 @@ def main(
 
     # Run
     mp.spawn(fsdp_main,
-        args=(world_size, args),
-        nprocs=torch.cuda.device_count(),
-        join=True)
+        args = (world_size, args),
+        nprocs = torch.cuda.device_count(),
+        join = True) 
