@@ -1,0 +1,35 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "fsdp_train",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "args": [
+                "--model_name", "facebook/esm1v_t33_650M_UR90S_1",
+                "--precision", "fp32",
+                "--model_type", "masked",
+                "--train_type", "lora",
+                "--lora_rank", "8",
+                "--lora_alpha", "8",
+                "--lora_dropout", "0.1",
+                "--lora_target_modules", "query,value",
+                "--dataset", "confit",
+                "--batch_size", "3",
+                "--log_to", "stdout",
+                "--num_epochs", "10",
+                "--lr", "5e-4",
+                "--lr_scheduler", "constant",
+                "--gradient_accumulation_steps", "1"
+
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true,
+        }
+    ]
+}
