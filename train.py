@@ -73,6 +73,7 @@ from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 # check_fn in activation checkpointing (LlamaDecoderLayer for llama models for example)
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LLAMA_ATTENTION_CLASSES, LlamaMLP
 
+# From: https://github.com/IDEA-Research/DisCo-CLIP/tree/main
 import disco
 
 # To get rid of tokenizers warnings for now
