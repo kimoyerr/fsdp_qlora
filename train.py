@@ -47,6 +47,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     apply_activation_checkpointing,
 )
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # Model loading
 from bitsandbytes.nn import Linear4bit, Params4bit
@@ -71,6 +72,8 @@ from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 # For different model types, we'll want to import the right class for the
 # check_fn in activation checkpointing (LlamaDecoderLayer for llama models for example)
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LLAMA_ATTENTION_CLASSES, LlamaMLP
+
+import disco
 
 # To get rid of tokenizers warnings for now
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -103,6 +106,12 @@ class Logger:
 
     def finish(self, rank=0):
         if self.log_to == "wandb" and rank==0: wandb.finish()
+
+
+def trace_handler(p):
+    output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
+    print(output)
+    p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
 
 
 def update_progress_bar(progress_bar:tqdm, epoch:int, log_loss:float, log_lr:float, rank:int):
@@ -867,134 +876,200 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     log_loss, log_lr = 0.0, -1
     # Reset peak memory to track that
     torch.cuda.reset_peak_memory_stats(local_rank)
-    for epoch in range(args['num_epochs']):
-        update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
-        model.train()
-        ddp_loss = torch.zeros(2).to(local_rank)
+    with torch.profiler.profile(
+       activities=[
+           torch.profiler.ProfilerActivity.CPU,
+           torch.profiler.ProfilerActivity.CUDA,
+       ],
+       schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
+       record_shapes=True,
+       profile_memory=True,
+       with_stack=True,
+       on_trace_ready=trace_handler,
+    ) as prof:
+        # for epoch in range(args['num_epochs']):
+        for epoch in range(1):
+            
+            update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
+            model.train()
+            ddp_loss = torch.zeros(2).to(local_rank)
 
-        total_loss = torch.zeros(1).to(local_rank)
+            total_loss = torch.zeros(1).to(local_rank)
 
-        for batch_idx, batch in enumerate(dataloader):
-            accumulate_grads = (batch_idx+1) % gradient_accumulation_steps == 0
+            for batch_idx, batch in enumerate(dataloader):
+                print(epoch, batch_idx)
+                prof.step()
+                accumulate_grads = (batch_idx+1) % gradient_accumulation_steps == 0
 
-            # Prevent gradient syncing until update step if using no_sync option.
-            # Documentation states this should only be used on the root FSDP instance
-            # We assume this is a one-node setup
-            if args['no_sync'] and not accumulate_grads:
-                sync_context = model.no_sync()
-            else:
-                sync_context = nullcontext()
-
-            # Start logging memory (first iter) if requested
-            if batch_idx==0 and rank == 0 and epoch == 0 and args['profile_memory']:
-                torch.cuda.memory._record_memory_history()
-
-            # Log memory usage
-            if batch_idx == 4 and epoch == 0:
-                logger.log({"memory_before_forward": torch.cuda.memory_allocated(local_rank)/1e9}, rank)
-
-            # Forward pass
-            with sync_context:
-                if args["dataset"] == "confit":
-                    from confit.stat_utils import compute_score, BT_loss
-
-                    with autocast:
-                        seq, mask = batch[0], batch[1]
-                        wt, wt_mask = batch[2], batch[3]
-                        pos = batch[4]
-                        golden_score = batch[5]
-                        score, logits = compute_score(model, seq, mask, wt, pos, tokenizer)
-                        score = score.to(local_rank)
-
-                        # BT loss
-                        loss = BT_loss(score, golden_score)
-                        # print(loss, local_rank)
+                # Prevent gradient syncing until update step if using no_sync option.
+                # Documentation states this should only be used on the root FSDP instance
+                # We assume this is a one-node setup
+                if args['no_sync'] and not accumulate_grads:
+                    sync_context = model.no_sync()
                 else:
-                    with autocast:
-                        output = model(
-                            batch['input_ids'].to(local_rank),
-                            labels=batch['labels'].to(local_rank),
-                            attention_mask=None,
-                        )
-                        loss = output.loss
+                    sync_context = nullcontext()
 
-                # Scale loss for gradient accumulation
-                total_loss += loss.item()
-                loss = loss / gradient_accumulation_steps
+                # Start logging memory (first iter) if requested
+                if batch_idx==0 and rank == 0 and epoch == 0 and args['profile_memory']:
+                    torch.cuda.memory._record_memory_history()
 
                 # Log memory usage
                 if batch_idx == 4 and epoch == 0:
-                    logger.log({"memory_after_forward": torch.cuda.memory_allocated(local_rank)/1e9}, rank)
+                    logger.log({"memory_before_forward": torch.cuda.memory_allocated(local_rank)/1e9}, rank)
 
-                # Backward pass
-                if scale_grads:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                # Forward pass
+                with sync_context:
+                    if args["dataset"] == "confit":
+                        from confit.stat_utils import compute_score, BT_loss, BT_loss_disco, BT_loss_disco_gather
 
-            # Record loss
-            bs = batch[0].shape[0]
-            ddp_loss[0] += loss.item() * bs * gradient_accumulation_steps
-            ddp_loss[1] += bs
+                        with autocast:
+                            with record_function("## forward ##"):
+                                seq, mask = batch[0], batch[1]
+                                wt, wt_mask = batch[2], batch[3]
+                                pos = batch[4]
+                                golden_score = batch[5]
+                                score, logits, out, log_probs = compute_score(model, seq, mask, wt, pos, tokenizer)
+                                score = score.to(local_rank)
+                                golden_score = golden_score.to(local_rank)
+                                
 
-            # Step the optimizer (w/ gradient accumulation)
-            if accumulate_grads:
-                if args['apply_gradient_clipping'] and (args['grad_norm'] is not None):
-                    model.clip_grad_norm_(args['grad_norm'], norm_type=2.0)
-                if scale_grads:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad()
-                # avoid overhead when lr is constant.
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
-                progress_bar.update(1)
+                                # BT loss
+                                disco = 1
+                                if disco:
+                                    loss, local_scores, all_scores, all_golden_scores = BT_loss_disco_gather(local_rank, score, golden_score)
+                                else:
+                                    loss = BT_loss(score, golden_score)
+                            # Add backward to propagate to the model
 
-            # Log memory usage after backwards
-            if batch_idx == 4 and epoch == 0:
-                logger.log({"memory_after_backward": torch.cuda.memory_allocated(local_rank)/1e9}, rank)
-
-            # Delete the output so more memory frees up before the next forward pass
-            output = None
-            loss = None
-
-            # Stop logging memory (first iter)
-            if batch_idx==0 and rank == 0 and epoch == 0 and args['profile_memory']:
-                torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
-                torch.cuda.memory._record_memory_history(enabled=None) # Stop recording
-
-            # Log loss every gradient update steps
-            if accumulate_grads:
-                dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
-                # dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-                if rank == 0:
-                    log_loss = ddp_loss[0] / ddp_loss[1]
-                    print(ddp_loss)
-                    print(total_loss)
-                    if lr_scheduler is not None:
-                        log_lr = lr_scheduler.get_last_lr()[0]
                     else:
-                        log_lr = args["lr"]
-                    update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
-                    if args["log_to"] == 'wandb':
-                        logger.log({"loss": log_loss, "lr": log_lr}, rank)
-                ddp_loss = torch.zeros(2).to(local_rank)
+                        with autocast:
+                            output = model(
+                                batch['input_ids'].to(local_rank),
+                                labels=batch['labels'].to(local_rank),
+                                attention_mask=None,
+                            )
+                            loss = output.loss
 
-        # Print + log peak memory usage for the whole first step of training
-        if epoch == 0 and rank == 0:
-            peak_memory = torch.cuda.max_memory_allocated(local_rank)
-            if args["verbose"]:
-                print_func(f"Peak memory usage (training): {peak_memory/1e9:.2f}GB", rank)
-            if args["log_to"] == 'wandb':
-                logger.log({"memory_peak": peak_memory}, rank)
+                    # Scale loss for gradient accumulation
+                    total_loss += loss.item()
+                    loss = loss / gradient_accumulation_steps
 
-        if rank == 0:
-            print(total_loss)
-        elif rank == 1:
-            print(total_loss)
+                    # Log memory usage
+                    if batch_idx == 4 and epoch == 0:
+                        logger.log({"memory_after_forward": torch.cuda.memory_allocated(local_rank)/1e9}, rank)
+
+                    # Backward pass
+                    if scale_grads:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                        # if args["dataset"] == "confit" and disco:
+                        #     print(all_scores.grad)
+                        #     scores_grad = all_scores.grad
+                        #     torch.distributed.all_reduce(scores_grad, op=torch.distributed.ReduceOp.AVG)
+                        #     local_scores.backward(scores_grad[batch[0].shape[0]*local_rank:batch[0].shape[0]*(local_rank+1)])
+
+
+                # Record loss
+                bs = batch[0].shape[0]
+                ddp_loss[0] += loss.item() * bs * gradient_accumulation_steps
+                ddp_loss[1] += bs
+
+                # Step the optimizer (w/ gradient accumulation)
+                if accumulate_grads:
+                    if args['apply_gradient_clipping'] and (args['grad_norm'] is not None):
+                        model.clip_grad_norm_(args['grad_norm'], norm_type=2.0)
+                    if scale_grads:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    model.zero_grad(set_to_none=True)
+                    # Set other grads to zero
+                    if args["dataset"] == "confit":
+                        if disco:
+                            all_scores.grad = None
+                            local_scores.grad = None
+                            scores_grad = None
+                            all_golden_scores.grad = None
+                            out.grad = None
+                            log_probs.grad = None
+                        golden_score.grad = None
+                        score.grad = None
+                        logits.grad = None
+                        loss.grad = None
+
+                    # avoid overhead when lr is constant.
+                    if lr_scheduler is not None:
+                        lr_scheduler.step()
+                    progress_bar.update(1)
+
+                # Log memory usage after backwards
+                if batch_idx == 4 and epoch == 0:
+                    logger.log({"memory_after_backward": torch.cuda.memory_allocated(local_rank)/1e9}, rank)
+
+                # Delete the output so more memory frees up before the next forward pass
+                output = None
+                loss = None
+                logits = None
+                score = None
+                golden_score = None
+                if disco:
+                    local_scores = None
+                    all_scores = None
+                    all_golden_scores = None
+                    out = None
+                    log_probs = None
+
+                # Stop logging memory (first iter)
+                if batch_idx == 0 and rank == 0 and epoch == 0 and args['profile_memory']:
+                    torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+                    with open("memory_snapshot.pickle", 'rb') as f:
+                        loaded_data = pickle.load(f)
+                    memory_df = pd.read_pickle("memory_snapshot.pickle")
+
+                    torch.cuda.memory._record_memory_history(enabled=None) # Stop recording
+
+                # Log loss every gradient update steps
+                if accumulate_grads:
+                    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+                    # dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+                    if rank == 0:
+                        log_loss = ddp_loss[0] / ddp_loss[1]
+                        print(ddp_loss)
+                        print(total_loss)
+                        if lr_scheduler is not None:
+                            log_lr = lr_scheduler.get_last_lr()[0]
+                        else:
+                            log_lr = args["lr"]
+                        update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
+                        if args["log_to"] == 'wandb':
+                            logger.log({"loss": log_loss, "lr": log_lr}, rank)
+                    ddp_loss = torch.zeros(2).to(local_rank)
+
+                    torch.cuda.empty_cache()
+
+                    if batch_idx == 2:
+                        break
+                else:
+                    torch.cuda.empty_cache()
+            
+            # Print + log peak memory usage for the whole first step of training
+            if epoch == 0 and rank == 0:
+                peak_memory = torch.cuda.max_memory_allocated(local_rank)
+                if args["verbose"]:
+                    print_func(f"Peak memory usage (training): {peak_memory/1e9:.2f}GB", rank)
+                if args["log_to"] == 'wandb':
+                    logger.log({"memory_peak": peak_memory}, rank)
+
+            if rank == 0:
+                print(total_loss)
+            elif rank == 1:
+                print(total_loss)
     # Synchronize at the end and record time
+    prof.export_memory_timeline(f"confit_memory.html", device="cuda:"+str(local_rank))
+    # prof.export_memory_timeline(f"confit_memory.html", device="cuda:1")
     init_end_event.record()
     dist.barrier()
     torch.cuda.synchronize()
