@@ -1,0 +1,4 @@
+biopython
+ConFit
+huggingface_hub[cli]
+
