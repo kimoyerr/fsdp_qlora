@@ -5,6 +5,9 @@ See the "README" file for general information about running FSDP_QLORA from Answ
 ## Data
 All data used for training/finetuning is on S3 and versioned using [DVC](https://dvc.org/doc/start)
 
+## Pre-process proteingym data
+To pre-process proteingym data to be used for ConFit fintuning use the ```nbs/protein_data_preprocessing.ipynb``` notebook
+
 ### Useful DVC commands
 ```dvc pull``` to pull to the local repo folde, the latest version of the data from S3
 ```dvc add``` if you make any changes to the files
