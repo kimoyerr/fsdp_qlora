@@ -1,0 +1,23 @@
+# For Few-shot finetuning using ConFit
+python train.py \
+--model_name facebook/esm1v_t33_650M_UR90S_1 \
+--precision fp32 \
+--model_type masked \
+--train_type lora \
+--lora_rank 8 \
+--lora_alpha 8 \
+--lora_dropout 0.1 \
+--lora_target_modules query,value \
+--dataset confit \
+--batch_size 3 \
+--log_to wandb \
+--num_epochs 100 \
+--lr 5e-4 \
+--lr_scheduler constant \
+--eval_interval 3 \
+--gradient_accumulation_steps 1 \
+--protein_dataset RASH_HUMAN_Bandaru_2017 \
+--protein_trainset_path /ConFit/data/proteingym/RASH_HUMAN_Bandaru_2017/train_1536_shot.csv \
+--protein_valset_path /ConFit/data/proteingym/RASH_HUMAN_Bandaru_2017/val_1536_shot.csv \
+--protein_testset_path /ConFit/data/proteingym/RASH_HUMAN_Bandaru_2017/test.csv \
+--project_name fsdp_qlora_confit_fewshot_finetuning 
