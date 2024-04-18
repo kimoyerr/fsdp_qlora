@@ -13,6 +13,7 @@ Not all combinations of arguments will work. See the accompanying blog post for 
 # Imports
 
 # General
+import glob
 import torch, os, gc, time, safetensors, copy, math, types
 import functools
 import torch.optim as optim
@@ -73,8 +74,8 @@ from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 # check_fn in activation checkpointing (LlamaDecoderLayer for llama models for example)
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LLAMA_ATTENTION_CLASSES, LlamaMLP
 
-# From: https://github.com/IDEA-Research/DisCo-CLIP/tree/main
-import disco
+
+from confit.train import evaluate
 
 # To get rid of tokenizers warnings for now
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -91,6 +92,7 @@ class Logger:
         self.log_to = log_to
         if self.log_to == "wandb" and rank==0:
             import wandb
+            
             wandb.init(project=project_name, entity=entity, group=group, name=name, config=args)
 
     def log(self, d:Dict, rank:int):
@@ -372,28 +374,28 @@ def get_confit_dataloader(args:Dict):
     from transformers import EsmForMaskedLM, EsmTokenizer
     from confit.data_utils import Mutation_Set
 
-    train_csv = pd.DataFrame(None)
-    data_dir = "/ConFit/data"
-    dataset_name = "ENVZ_ECOLI_Ghose_2023"
-    model_seed = 1
-    test_csv = pd.read_csv(f"{data_dir}/{dataset_name}/test.csv")
-    for i in range(1, 6):
-        if i == model_seed:
-            val_csv = pd.read_csv(f"{data_dir}/{dataset_name}/train_{i}.csv")   #using 1/5 train data as validation set
-        temp_csv = pd.read_csv(f"{data_dir}/{dataset_name}/train_{i}.csv")
-        train_csv = pd.concat([train_csv, temp_csv], axis=0)
+    dataset_name = args["protein_dataset"]
+
+    train_csv = pd.read_csv(args["protein_trainset_path"])
+    test_csv = pd.read_csv(args["protein_testset_path"])
+    val_csv = pd.read_csv(args["protein_valset_path"])
     
+    model_seed = 1
     tokenizer = EsmTokenizer.from_pretrained(f'facebook/esm1v_t33_650M_UR90S_{model_seed}')
     trainset = Mutation_Set(data=train_csv, fname=dataset_name, tokenizer=tokenizer)
-    print(len(trainset))
+    valset = Mutation_Set(data=val_csv, fname=dataset_name,  tokenizer=tokenizer)
+    testset = Mutation_Set(data=test_csv, fname=dataset_name,  tokenizer=tokenizer)
+    print(len(trainset), len(valset), len(testset))
 
     # For distributed training, use DistributedSampler
     sampler = DistributedSampler(trainset, seed=args["seed"])
 
     # No collate function since trainset already has one
     dataloader = DataLoader(trainset, batch_size=args["batch_size"], collate_fn=trainset.collate_fn, sampler=sampler)
+    valloader = DataLoader(valset, batch_size=args["batch_size"], collate_fn=valset.collate_fn)
+    testloader = DataLoader(testset, batch_size=args["batch_size"], collate_fn=testset.collate_fn)
 
-    return dataloader
+    return dataloader, valloader, testloader
 
 
 # LR scheduler.
@@ -588,6 +590,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     torch.cuda.set_device(local_rank)
 
     # Start logging
+    if args["group"] is None:
+        args["group"] = args["protein_dataset"]
     logger = Logger(args, log_to=args["log_to"], project_name=args["project_name"],
                     entity=args["entity"], group=args["group"], name=args["name"], rank=rank)
 
@@ -628,7 +632,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     if args["dataset"]!="confit":
         dataloader = get_dataloader(tokenizer, args)
     else:
-        dataloader = get_confit_dataloader(args)
+        dataloader, valloader, testloader = get_confit_dataloader(args)
 
 
     # Create model
@@ -875,21 +879,29 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     progress_bar = tqdm(range(num_training_steps), disable=rank != 0)
     init_start_event.record()
     log_loss, log_lr = 0.0, -1
+    
+    # Set context manager for memory tracking
+    if args["torch_profile_memory"]:
+        memory_profile_context = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=True,
+                        on_trace_ready=trace_handler,
+                        )
+    else:
+        memory_profile_context = nullcontext()
     # Reset peak memory to track that
     torch.cuda.reset_peak_memory_stats(local_rank)
-    with torch.profiler.profile(
-       activities=[
-           torch.profiler.ProfilerActivity.CPU,
-           torch.profiler.ProfilerActivity.CUDA,
-       ],
-       schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
-       record_shapes=True,
-       profile_memory=True,
-       with_stack=True,
-       on_trace_ready=trace_handler,
-    ) as prof:
-        # for epoch in range(args['num_epochs']):
-        for epoch in range(1):
+
+    # Run epochs with memory profiler
+    with memory_profile_context as prof:
+        total_batches = 0
+        for epoch in range(args['num_epochs']):
             
             update_progress_bar(progress_bar, epoch, log_loss, log_lr, rank)
             model.train()
@@ -897,9 +909,23 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
             total_loss = torch.zeros(1).to(local_rank)
 
+            # Evaluate model before first iteration
+            if args["dataset"] == "confit" and epoch == 0:
+                # Validation
+                sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
+                print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
+                logger.log({"val_spearman": sr}, rank)
+                # Test
+                sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
+                print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
+                logger.log({"test_spearman": sr}, rank)
+
+
             for batch_idx, batch in enumerate(dataloader):
-                print(epoch, batch_idx)
-                prof.step()
+                total_batches += 1
+                # print(epoch, batch_idx)
+                if args["torch_profile_memory"]:
+                    prof.step()
                 accumulate_grads = (batch_idx+1) % gradient_accumulation_steps == 0
 
                 # Prevent gradient syncing until update step if using no_sync option.
@@ -932,7 +958,6 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                                 score, logits, out, log_probs = compute_score(model, seq, mask, wt, pos, tokenizer)
                                 score = score.to(local_rank)
                                 golden_score = golden_score.to(local_rank)
-                                
 
                                 # BT loss
                                 disco = 1
@@ -965,7 +990,6 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     else:
                         loss.backward()
                         # if args["dataset"] == "confit" and disco:
-                        #     print(all_scores.grad)
                         #     scores_grad = all_scores.grad
                         #     torch.distributed.all_reduce(scores_grad, op=torch.distributed.ReduceOp.AVG)
                         #     local_scores.backward(scores_grad[batch[0].shape[0]*local_rank:batch[0].shape[0]*(local_rank+1)])
@@ -984,9 +1008,10 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                         scaler.step(optimizer)
                         scaler.update()
                     else:
+                        # optimizer.zero_grad(set_to_none=True)
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-                    model.zero_grad(set_to_none=True)
+                    # model.zero_grad(set_to_none=True)
                     # Set other grads to zero
                     if args["dataset"] == "confit":
                         if disco:
@@ -1051,11 +1076,21 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
                     torch.cuda.empty_cache()
 
-                    if batch_idx == 2:
-                        break
+                    # if batch_idx == 2:
+                    #     break
                 else:
                     torch.cuda.empty_cache()
             
+            # Evaluate model
+            if epoch % args["eval_interval"] == 0:
+                sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
+                print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
+                logger.log({"val_spearman": sr}, rank)
+                # Test
+                sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
+                print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
+                logger.log({"test_spearman": sr}, rank)
+
             # Print + log peak memory usage for the whole first step of training
             if epoch == 0 and rank == 0:
                 peak_memory = torch.cuda.max_memory_allocated(local_rank)
@@ -1068,9 +1103,12 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 print(total_loss)
             elif rank == 1:
                 print(total_loss)
+
+
     # Synchronize at the end and record time
-    prof.export_memory_timeline(f"confit_memory.html", device="cuda:"+str(local_rank))
-    # prof.export_memory_timeline(f"confit_memory.html", device="cuda:1")
+    if args["log_memory"]:
+        prof.export_memory_timeline(f"confit_memory.html", device="cuda:"+str(local_rank))
+        # prof.export_memory_timeline(f"confit_memory.html", device="cuda:1")
     init_end_event.record()
     dist.barrier()
     torch.cuda.synchronize()
@@ -1138,8 +1176,9 @@ def main(
     batch_size: int = 1, # Batch size per GPU. Effective BS = batch_size * world_size * gradient_accumulation_steps
     context_length: int = 512, # Max length of input sequence (in tokens)
     gradient_accumulation_steps: int = 1, # How many steps to accumulate gradients over (increases effective batch size)
-    num_epochs: int = 1, # How many epochs of training to do
+    num_epochs: int = 100, # How many epochs of training to do
     dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql", "confit"]) = "alpaca_sample", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
+    protein_dataset: str = None, # Protein dataset to use. If None, uses the default dataset for the model
     sharding_strategy: Param("", choices=["full_shard", "shard_grad_op", "ddp", "hybrid_full_shard", "hybrid_shard_grad_op"]) = "full_shard", # Sharding strategy for FSDP
     use_gradient_checkpointing: bool_arg = True, # Use FSDP's activation checkpointing
     reentrant_checkpointing: bool_arg = False, # Use re-entrant autograd activation checkpointing. Setting to True can use less GPU memory with BNB QLoRA
@@ -1168,10 +1207,15 @@ def main(
     master_addr: str = "localhost", # For distributed training
     master_port: str = "12355", # For distributed training, must be the same for all processes
     seed: int = 42, # Random seed
+    eval_interval: int = 10, # After how many epochs should we evaluate the model
     project_name: str = "fsdp_qlora", # For wandb logging
     name: str = None, # For wandb logging
     group: str = None, # For wandb logging
     entity: str = None, # For wandb logging
+    torch_profile_memory: bool_arg = False, # Profile memory using pytorch
+    protein_trainset_path: str = None, # Training file
+    protein_valset_path: str = None, # Validation file
+    protein_testset_path: str = None, # Test file
 ):
 
     # Set world size
