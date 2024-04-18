@@ -1,0 +1,6 @@
+outs:
+- md5: e38a532411b51efede08b97def155a79.dir
+  size: 82834736
+  nfiles: 357
+  hash: md5
+  path: protein_data
