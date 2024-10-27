@@ -13,7 +13,6 @@ Not all combinations of arguments will work. See the accompanying blog post for 
 # Imports
 
 # General
-import glob
 import torch, os, gc, time, safetensors, copy, math, types
 import functools
 import torch.optim as optim
@@ -41,7 +40,7 @@ from torch.distributed.fsdp import MixedPrecision, FullyShardedDataParallel as F
 from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
 from torch.distributed.fsdp.api import BackwardPrefetch, CPUOffload, ShardingStrategy
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
     offload_wrapper,
@@ -382,9 +381,9 @@ def get_confit_dataloader(args:Dict):
     
     model_seed = 1
     tokenizer = EsmTokenizer.from_pretrained(f'facebook/esm1v_t33_650M_UR90S_{model_seed}')
-    trainset = Mutation_Set(data=train_csv, fname=dataset_name, tokenizer=tokenizer)
-    valset = Mutation_Set(data=val_csv, fname=dataset_name,  tokenizer=tokenizer)
-    testset = Mutation_Set(data=test_csv, fname=dataset_name,  tokenizer=tokenizer)
+    trainset = Mutation_Set(wt_path=args["wt_fasta_path"], data=train_csv, fname=dataset_name, tokenizer=tokenizer)
+    valset = Mutation_Set(wt_path=args["wt_fasta_path"], data=val_csv, fname=dataset_name,  tokenizer=tokenizer)
+    testset = Mutation_Set(wt_path=args["wt_fasta_path"], data=test_csv, fname=dataset_name,  tokenizer=tokenizer)
     print(len(trainset), len(valset), len(testset))
 
     # For distributed training, use DistributedSampler
@@ -392,8 +391,8 @@ def get_confit_dataloader(args:Dict):
 
     # No collate function since trainset already has one
     dataloader = DataLoader(trainset, batch_size=args["batch_size"], collate_fn=trainset.collate_fn, sampler=sampler)
-    valloader = DataLoader(valset, batch_size=args["batch_size"], collate_fn=valset.collate_fn)
-    testloader = DataLoader(testset, batch_size=args["batch_size"], collate_fn=testset.collate_fn)
+    valloader = DataLoader(valset, batch_size=args["val_batch_size"], collate_fn=valset.collate_fn)
+    testloader = DataLoader(testset, batch_size=args["val_batch_size"], collate_fn=testset.collate_fn)
 
     return dataloader, valloader, testloader
 
@@ -493,7 +492,8 @@ def get_wrapping_policy(custom_policy:bool=False, transformer_layer_name="LlamaD
 # Copied from peft.utils.other and modified the exception when the transformer layer class could not be found to a warning
 def fsdp_auto_wrap_policy_confit(model):
 
-    from accelerate import FullyShardedDataParallelPlugin
+    # from accelerate import FullyShardedDataParallelPlugin
+    from accelerate.utils.dataclasses import get_module_class_from_name
     from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
 
     default_transformer_cls_names_to_wrap = (
@@ -504,7 +504,7 @@ def fsdp_auto_wrap_policy_confit(model):
     ).split(",")
     transformer_cls_to_wrap = {PrefixEncoder, PromptEncoder, PromptEmbedding}
     for layer_class in transformer_cls_names_to_wrap:
-        transformer_cls = FullyShardedDataParallelPlugin.get_module_class_from_name(model, layer_class)
+        transformer_cls = get_module_class_from_name(model, layer_class)
         if transformer_cls is None:
             # Add a warning here instead of raising an exception
             print(f"Warning: Transformer layer class {layer_class} not found in model")
@@ -571,6 +571,56 @@ class LORA(nn.Module):
 
         return result
 
+# Save checkpoint: Modified from https://github.com/pytorch/torchtune/blob/main/recipes/lora_finetune_distributed.py
+def save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    total_epochs,
+    rank,
+    output_dir,
+):
+    """
+    Checkpoint the state of the recipe. The constructed checkpoint state dict
+    contains the following information:
+    - Merged weights with key MODEL_KEY
+    - Adapter weights with key ADAPTER_KEY
+    - Relevant recipe state if training is not complete
+
+    Checkpointer will save the merged weights, adapter weights and recipe state in
+    different checkpoint files. To correctly resume from training, the adapter weights
+    and recipe state must be provided along with the base model weights.
+    """
+    # final dict passed onto the checkpointer
+    checkpoint_dict = {}
+
+    intermediate_checkpoint = epoch + 1 < total_epochs
+    # To prevent GPU memory from spiking during checkpoint save,
+    # we consolidate the full model and optim state dicts on CPU for rank 0
+    with FSDP.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        cpu_state_dict = model.state_dict()
+        if intermediate_checkpoint:
+            # opt_state_dict = FSDP.optim_state_dict(model, optimizer)
+            opt_state_dict = None  # For now, lets turn this off since we don't need to use these optimizer state to resume training.
+        else:
+            opt_state_dict = None
+
+    # Now that we have the model and opt state dict, create the actual checkpoint dict
+    # to be sent to the checkpointer and ultimately written to file
+    if rank == 0:
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        print("Saving full model weights: intermediate checkpoint")
+        if epoch == -1:  # Before training
+            epoch= "start"
+        save_file(cpu_state_dict, os.path.join(output_dir, f"model_state_dict_epoch_{epoch}.safetensors"))
+        print("Done", rank)
+
 
 # Main function, run on each process
 def fsdp_main(local_rank:int, world_size:int, args:Dict):
@@ -628,6 +678,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     tokenizer = AutoTokenizer.from_pretrained(args["model_name"])
     tokenizer.pad_token_id = tokenizer.eos_token_id # TODO check if it exists first
 
+
     # Set up dataloader
     if args["dataset"]!="confit":
         dataloader = get_dataloader(tokenizer, args)
@@ -639,7 +690,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     cfg = None
     attn_impl = "sdpa" # torch 2.2 sdpa uses flash attn 2
     print("Creating model", rank)
-    if args["train_type"] in ["full", "lora", "custom_lora"]:
+    if args["train_type"] in ["full", "lora", "dora", "custom_lora"]:
         if (args["low_memory"] and rank == 0) or (not args["low_memory"]):
             if args["model_type"] == "masked":
                 model = AutoModelForMaskedLM.from_pretrained(
@@ -669,73 +720,16 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch_dtype)
             if args["precision"] == "bf16":
                 model.to(torch_dtype)
-    elif args["train_type"] in ["qlora", "custom_qlora", "hqq_lora"]: # Our custom loading
-        cfg = AutoConfig.from_pretrained(args["model_name"])
-        cfg.use_cache = False
-        cfg._attn_implementation = attn_impl
-
-        # load model on meta device without calling init and replace nn.Linear with Linear4bit
-        with init_empty_weights():
-            if args["model_type"] == "masked":
-                model = AutoModelForMaskedLM.from_config(cfg)
-            else:
-                model = AutoModelForCausalLM.from_config(cfg)
-            if args["train_type"] in ["hqq_lora"]:
-                # TODO: Tune BaseQuantizeConfig.
-                quant_config = BaseQuantizeConfig(nbits=4, group_size=64, quant_zero=True,
-                                                  quant_scale=True, offload_meta=True, view_as_float=True)
-                model.model = replace_linear(model.model, HQQLinear, quant_config, device=rank,
-                                             compute_dtype=compute_dtype, del_orig=True, initialize=False)
-                HQQLinear.set_backend(HQQBackend.ATEN_BACKPROP)
-            else:
-                model.model = replace_linear(model.model, Linear4bit, compute_dtype=compute_dtype,
-                                             quant_type='nf4', quant_storage=torch_dtype)
-        model.is_loaded_in_4bit = True
-
-        # Grab the safetensors files that hold the weights
-        try:
-            idx = hub.cached_file(args["model_name"], SAFE_WEIGHTS_INDEX_NAME)
-            files, _ = hub.get_checkpoint_shard_files(args["model_name"], idx)
-        except OSError:
-            try:
-                # This means the model doesn't have a model.safetensors.index.json because it is not sharded
-                files = []
-                files.append(hub.cached_file(args["model_name"], SAFE_WEIGHTS_NAME))
-            except OSError as e:
-                # This means the model probably doesn't have a safetensors file
-                raise e
-
-        # Load in the weights, using our custom load_and_quantize method which quantizes Params4bit on the fly
-        # and then places each layer on CPU or meta if using low_memory to minimize GPU memory usage
-        def load_and_quantize_parallel(name_param, model, **kwargs):
-            name, param = name_param
-            load_and_quantize(model, name, param, **kwargs)
-
-        print("Loading model", rank)
-        param_count = sum((p.numel() for n,p in model.named_parameters()))
-        if rank == 0 and args['verbose']:
-            print_func(f"Total model params: {param_count}")
-        start = time.time()
-        for filename in files:
-            weights = safetensors.torch.load_file(filename)
-            quant_method = "hqq" if args["train_type"] in ["hqq_lora"] else "bnb"
-            devprops = torch.cuda.get_device_properties(torch.cuda.current_device())
-            left = int(os.cpu_count()/torch.cuda.device_count())
-            right = int(8 * (devprops.total_memory/1e9/40) * (70/(param_count/1e9)))
-            n_workers = min(left, right)
-            if rank == 0 and args['verbose']:
-                print_func(f"Using n_workers: {n_workers} for loading")
-            parallel(load_and_quantize_parallel, iter(weights.items()), n_workers=n_workers, threadpool=True,
-                     model=model, dtype=torch_dtype, device=local_rank, skip_names=load_param_skip_names,
-                     is_meta_rank=(args["low_memory"] and rank!=0), verbose=args["verbose"], quant_method=quant_method)
-        if rank == 0 and args["verbose"]:
-            print(f"Loaded model weights in {time.time()-start:.3f} seconds")
 
     print("Model created", rank, f"{torch.cuda.memory_allocated(local_rank)/1e9:.3f} GB")
 
 
     # PEFT setup (LoRA and QLoRA)
-    if args["train_type"] in ["lora", "qlora"]:
+    if args["train_type"] in ["lora", "qlora", "dora"]:
+        if args["train_type"] == "dora":
+            use_dora = 1
+        else:
+            use_dora = 0
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, 
             inference_mode=False,
@@ -743,6 +737,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             lora_alpha=args["lora_alpha"],
             lora_dropout=args["lora_dropout"],
             target_modules=args["lora_target_modules"],
+            use_dora=use_dora,
         )
         # PEFT will move quant_state to meta device, so this method prevents that
         # from happening by replacing quant_state.to with a dummy function
@@ -756,24 +751,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         elif args['low_memory']:
             # And then setup_quantized_peft_meta_for_training sets quant_state.to back to normal
             setup_quantized_peft_meta_for_training(model)
-    elif args["train_type"] in ["custom_qlora", "custom_lora", "hqq_lora"]:
-        # Create LORA layers.
-        for name, _ in model.named_modules():
-            module_key, _, value_key = name.rpartition('.')
-            if value_key in args['lora_target_modules']:
-                m = model.get_submodule(name)
-                qlora_layer = LORA(m, args["lora_rank"], args["lora_alpha"], args["lora_dropout"])
-                parent_module = model.get_submodule(module_key)
-                setattr(parent_module, value_key, qlora_layer)
-        for n,p in model.named_parameters():
-            if any([lora_name in n for lora_name in ['lora_AB', 'lora_A', 'lora_B']]):
-                p.requires_grad = True
-                if args['verbose']:
-                    print("Trainable LORA layer", n)
-            else:
-                p.requires_grad = False
 
-        print("LoRA layers added", rank, f"{torch.cuda.memory_allocated(local_rank)/1e9:.3f} GB")
 
     logger.log({"memory_after_model_creation": torch.cuda.memory_allocated(local_rank)}, rank)
 
@@ -781,8 +759,6 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     # Wrap model with llama-recipies or custom LoRA policy
     if args["dataset"] == "confit":
         my_auto_wrap_policy = fsdp_auto_wrap_policy_confit(model)
-    else:
-        my_auto_wrap_policy = get_wrapping_policy(args["train_type"] in ["custom_qlora", "hqq_lora"])
 
 
     print("Wrapping model w/ FSDP", rank)
@@ -815,7 +791,6 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     )
     print("Wrapped model", rank, f"{torch.cuda.memory_allocated(local_rank)/1e9:.3f} GB")
     logger.log({"memory_after_model_wrap": torch.cuda.memory_allocated(local_rank)}, rank)
-
 
     # Synchronize at the start
     dist.barrier()
@@ -853,6 +828,17 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     # Create the optimizer
     optimizer = get_optimizer(model, args)
 
+    # Save checkpoint
+    # if rank==0:
+    #     save_checkpoint(    
+    #         model,
+    #         optimizer,
+    #         epoch = -1,
+    #         total_epochs = args['num_epochs'],
+    #         rank = rank,
+    #         output_dir = args["output_dir"]
+    #     )
+
     # LR scheduler.
     gradient_accumulation_steps = max(1, args['gradient_accumulation_steps'])
     lr_scheduler, num_training_steps = get_lr_scheduler(optimizer, dataloader, gradient_accumulation_steps, args)
@@ -874,8 +860,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     scale_grads = scaler is not None
 
 
-    if rank == 0:
-        print("Total Training Steps:", num_training_steps)
+    # if rank == 0:
+    #     print("Total Training Steps:", num_training_steps)
     progress_bar = tqdm(range(num_training_steps), disable=rank != 0)
     init_start_event.record()
     log_loss, log_lr = 0.0, -1
@@ -909,16 +895,23 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
             total_loss = torch.zeros(1).to(local_rank)
 
+            # Save model before starting
+
             # Evaluate model before first iteration
             if args["dataset"] == "confit" and epoch == 0:
-                # Validation
-                sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
-                print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
-                logger.log({"val_spearman": sr}, rank)
-                # Test
-                sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
-                print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
-                logger.log({"test_spearman": sr}, rank)
+                with torch.no_grad():
+                    model.eval()
+                    # Validation
+                    print(f"validating_start")
+                    sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
+                    print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
+                    logger.log({"val_spearman": sr}, rank)
+                    # Test
+                    print(f"testing_test")
+                    sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
+                    print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
+                    logger.log({"test_spearman": sr}, rank)
+                    model.train()
 
 
             for batch_idx, batch in enumerate(dataloader):
@@ -958,6 +951,12 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                                 score, logits, out, log_probs = compute_score(model, seq, mask, wt, pos, tokenizer)
                                 score = score.to(local_rank)
                                 golden_score = golden_score.to(local_rank)
+
+                                # out_reg = model_reg(wt, wt_mask)
+                                # logits_reg = out_reg.logits
+                                # l_reg = KLloss(logits, logits_reg, seq, mask)
+
+                                # loss = l_BT + lambda_reg*l_reg
 
                                 # BT loss
                                 disco = 1
@@ -1083,13 +1082,30 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             
             # Evaluate model
             if epoch % args["eval_interval"] == 0:
-                sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
-                print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
-                logger.log({"val_spearman": sr}, rank)
-                # Test
-                sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
-                print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
-                logger.log({"test_spearman": sr}, rank)
+                with torch.no_grad():
+                    model.eval()
+                    print(f"validating")
+                    sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
+                    print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
+                    logger.log({"val_spearman": sr}, rank)
+                    # Test
+                    print(f"testing")
+                    sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
+                    print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
+                    logger.log({"test_spearman": sr}, rank)
+
+                    # save model
+                    save_checkpoint(    
+                        model,
+                        optimizer,
+                        epoch = epoch,
+                        total_epochs = args['num_epochs'],
+                        rank = rank,
+                        output_dir = args["output_dir"]
+                    )
+                    # dist.barrier()
+                    model.train()
+            
 
             # Print + log peak memory usage for the whole first step of training
             if epoch == 0 and rank == 0:
@@ -1106,8 +1122,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
 
     # Synchronize at the end and record time
-    if args["log_memory"]:
-        prof.export_memory_timeline(f"confit_memory.html", device="cuda:"+str(local_rank))
+    # if args["log_memory"]:
+    #     prof.export_memory_timeline(f"confit_memory.html", device="cuda:"+str(local_rank))
         # prof.export_memory_timeline(f"confit_memory.html", device="cuda:1")
     init_end_event.record()
     dist.barrier()
@@ -1172,12 +1188,14 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 @call_parse()
 def main(
     world_size: int = -1, # Number of GPUs to use. -1 = all available GPUs.
-    train_type: Param("", choices=["full", "lora", "qlora", "custom_qlora", "custom_lora", "hqq_lora"]) = "qlora", # "full", "lora", "qlora", or "custom_qlora"
+    train_type: Param("", choices=["full", "lora", "dora", "qlora", "custom_qlora", "custom_lora", "hqq_lora"]) = "qlora", # "full", "lora", "qlora", or "custom_qlora"
     batch_size: int = 1, # Batch size per GPU. Effective BS = batch_size * world_size * gradient_accumulation_steps
+    val_batch_size: int = 1, # Batch size for validation
     context_length: int = 512, # Max length of input sequence (in tokens)
     gradient_accumulation_steps: int = 1, # How many steps to accumulate gradients over (increases effective batch size)
     num_epochs: int = 100, # How many epochs of training to do
     dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql", "confit"]) = "alpaca_sample", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
+    wt_fasta_path: str = None, # Path to fasta file for wt sequences
     protein_dataset: str = None, # Protein dataset to use. If None, uses the default dataset for the model
     sharding_strategy: Param("", choices=["full_shard", "shard_grad_op", "ddp", "hybrid_full_shard", "hybrid_shard_grad_op"]) = "full_shard", # Sharding strategy for FSDP
     use_gradient_checkpointing: bool_arg = True, # Use FSDP's activation checkpointing
@@ -1208,6 +1226,7 @@ def main(
     master_port: str = "12355", # For distributed training, must be the same for all processes
     seed: int = 42, # Random seed
     eval_interval: int = 10, # After how many epochs should we evaluate the model
+    model_save_interval: int = 10, # After how many epochs should we save the model
     project_name: str = "fsdp_qlora", # For wandb logging
     name: str = None, # For wandb logging
     group: str = None, # For wandb logging
