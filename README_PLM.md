@@ -13,6 +13,29 @@ To pre-process proteingym data to be used for ConFit fintuning use the ```nbs/pr
 ```dvc add``` if you make any changes to the files
 ```dvc push``` to push the changed data back to S3
 
+# Installation Instructions for Finetuning using LoRA and ConFit
+```
+pip3 install safetensors
+pip3 install transformers
+pip3 install git+https://github.com/huggingface/accelerate
+pip3 install git+https://github.com/huggingface/peft.git
+pip3 install bitsandbytes
+pip3 install fastcore
+pip3 install biopython
+pip3 install wandb
+pip3 install seaborn
+pip3 install debugpy
+```
+
+```
+cd /home/ubuntu/Krishna-Llama/ConFit
+pip install -e .
+cd -
+
+cd /home/ubuntu/Krishna-Llama/DisCo-CLIP
+pip install -e .
+cd -
+```
 
 ## Finetuning
 To finetune, modify the train_PLM.sh file as needed and run it
