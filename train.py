@@ -902,15 +902,21 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 with torch.no_grad():
                     model.eval()
                     # Validation
+                    # time this
+
                     print(f"validating_start")
+                    logger.log({"validating_start": time.time()}, rank)
                     sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
                     print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
                     logger.log({"val_spearman": sr}, rank)
+                    logger.log({"validating_end": time.time()}, rank)
                     # Test
                     print(f"testing_test")
+                    logger.log({"testing_start": time.time()}, rank)
                     sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
                     print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
                     logger.log({"test_spearman": sr}, rank)
+                    logger.log({"testing_end": time.time()}, rank)
                     model.train()
 
 
@@ -1085,14 +1091,18 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 with torch.no_grad():
                     model.eval()
                     print(f"validating")
+                    logger.log({"validating_start": time.time()}, rank)
                     sr = evaluate(model, valloader, tokenizer, accelerator="fsdp")
                     print(f'========epoch{epoch}; val spearman correlation :{sr}=================')
                     logger.log({"val_spearman": sr}, rank)
+                    logger.log({"validating_end": time.time()}, rank)
                     # Test
                     print(f"testing")
+                    logger.log({"testing_start": time.time()}, rank)
                     sr = evaluate(model, testloader, tokenizer, accelerator="fsdp")
                     print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
                     logger.log({"test_spearman": sr}, rank)
+                    logger.log({"testing_end": time.time()}, rank)
 
                     # save model
                     save_checkpoint(    
