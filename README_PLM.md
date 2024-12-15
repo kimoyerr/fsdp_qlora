@@ -15,6 +15,7 @@ To pre-process proteingym data to be used for ConFit fintuning use the ```nbs/pr
 
 # Installation Instructions for Finetuning using LoRA and ConFit
 ```
+pip3 install datasets
 pip3 install safetensors
 pip3 install transformers
 pip3 install git+https://github.com/huggingface/accelerate
