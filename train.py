@@ -60,11 +60,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMasked
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from fastcore.parallel import parallel
 
-try:
-    from hqq.core.quantize import HQQLinear, HQQBackend, BaseQuantizeConfig
-except ImportError:
-    HQQLinear = None
-    pass
+# try:
+#     from hqq.core.quantize import HQQLinear, HQQBackend, BaseQuantizeConfig
+# except ImportError:
+#     HQQLinear = None
+#     pass
 
 # PEFT
 from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
@@ -715,7 +715,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             cfg._attn_implementation = attn_impl
             with init_empty_weights():
                 if args["model_type"] == "masked":
-                    model = AutoModelForMaskedLM.from_config(cfg, torch_dtype=torch_dtype)
+                    model = AutoModelForMaskedLM.from_config(cfg, torch_dtype=torch_dtype, attn_implementation="eager")
                 else:
                     model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch_dtype)
             if args["precision"] == "bf16":
@@ -747,6 +747,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         model = get_peft_model(model, peft_config)
 
         if rank==0:
+            # Save peft_config
+            peft_config.save_pretrained(args["output_dir"])
             model.print_trainable_parameters()
         elif args['low_memory']:
             # And then setup_quantized_peft_meta_for_training sets quant_state.to back to normal
@@ -917,6 +919,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     print(f'========epoch{epoch}; test spearman correlation :{sr}=================')
                     logger.log({"test_spearman": sr}, rank)
                     logger.log({"testing_end": time.time()}, rank)
+                    
                     model.train()
 
 
@@ -1113,6 +1116,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                         rank = rank,
                         output_dir = args["output_dir"]
                     )
+                    
                     # dist.barrier()
                     model.train()
             
