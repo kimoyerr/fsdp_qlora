@@ -368,7 +368,7 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
 
     return dataloader
 
-def get_confit_dataloader(args:Dict):
+def get_confit_dataloader(args, tokenizer):
 
     from transformers import EsmForMaskedLM, EsmTokenizer
     from confit.data_utils import Mutation_Set
@@ -380,7 +380,9 @@ def get_confit_dataloader(args:Dict):
     val_csv = pd.read_csv(args["protein_valset_path"])
     
     model_seed = 1
-    tokenizer = EsmTokenizer.from_pretrained(f'facebook/esm1v_t33_650M_UR90S_{model_seed}')
+    if tokenizer is None:
+        tokenizer = EsmTokenizer.from_pretrained(f'facebook/esm1v_t33_650M_UR90S_{model_seed}')
+        
     trainset = Mutation_Set(wt_path=args["wt_fasta_path"], data=train_csv, fname=dataset_name, tokenizer=tokenizer)
     valset = Mutation_Set(wt_path=args["wt_fasta_path"], data=val_csv, fname=dataset_name,  tokenizer=tokenizer)
     testset = Mutation_Set(wt_path=args["wt_fasta_path"], data=test_csv, fname=dataset_name,  tokenizer=tokenizer)
@@ -683,7 +685,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     if args["dataset"]!="confit":
         dataloader = get_dataloader(tokenizer, args)
     else:
-        dataloader, valloader, testloader = get_confit_dataloader(args)
+        dataloader, valloader, testloader = get_confit_dataloader(args, tokenizer=tokenizer)
 
 
     # Create model
@@ -705,7 +707,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     args["model_name"],
                     use_cache=False,
                     torch_dtype=torch_dtype,
-                    _attn_implementation=attn_impl
+                    _attn_implementation="eager",
+                    trust_remote_code=True,
                 )
             dtype = torch_dtype if args["precision"] == "bf16" else None
             model.to(dtype=dtype, device="cpu" if args["low_memory"] else rank)
