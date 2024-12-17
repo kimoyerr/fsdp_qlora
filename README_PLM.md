@@ -38,6 +38,17 @@ pip install -e .
 cd -
 ```
 
+# Conda install
+```
+conda env create --name pytorch24
+conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia
+conda install -c huggingface datasets transformers safetensors accelerate peft
+conda install -c conda-forge bitsandbytes wandb biopython debugpy seaborn
+conda install -c fastai fastcore
+```
+```
+python train.py --model_name hugohrban/progen2-base --precision bf16 --model_type causal --train_type lora --lora_rank 8 --lora_alpha 8 --lora_dropout 0.1 --lora_target_modules qkv_proj --dataset confit --batch_size 12 --log_to wandb --num_epochs 25 --lr 5e-4 --lr_scheduler constant --eval_interval 1 --model_save_interval 1 --gradient_accumulation_steps 1 --protein_dataset AAV5_VR4 --protein_trainset_path /home/jupyter/fsdp_qlora/data/AAV5_VR4/train_small.csv --protein_valset_path /home/jupyter/fsdp_qlora/data/AAV5_VR4/test_small.csv --protein_testset_path /home/jupyter/fsdp_qlora/data/AAV5_VR4/test_small.csv --wt_fasta_path /home/jupyter/fsdp_qlora/data/AAV5_VR4/wt.fasta --project_name fsdp_qlora_confit_fewshot_finetuning --save_model True --output_dir /home/jupyter/train_outputs/AAV_VR4
+```
 ## Finetuning
 To finetune, modify the train_PLM.sh file as needed and run it
 
