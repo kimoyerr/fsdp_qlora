@@ -626,6 +626,7 @@ def save_checkpoint(
 
 # Main function, run on each process
 def fsdp_main(local_rank:int, world_size:int, args:Dict):
+    print(args)
     print_func = tqdm.write if args["log_to"] == 'tqdm' else print
 
     # Setup and initialize the process group
@@ -713,14 +714,14 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             dtype = torch_dtype if args["precision"] == "bf16" else None
             model.to(dtype=dtype, device="cpu" if args["low_memory"] else rank)
         else:
-            cfg = AutoConfig.from_pretrained(args["model_name"])
+            cfg = AutoConfig.from_pretrained(args["model_name"], trust_remote_code=True)
             cfg.use_cache = False
             cfg._attn_implementation = attn_impl
             with init_empty_weights():
                 if args["model_type"] == "masked":
                     model = AutoModelForMaskedLM.from_config(cfg, torch_dtype=torch_dtype, attn_implementation="eager")
                 else:
-                    model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch_dtype)
+                    model = AutoModelForCausalLM.from_config(cfg, torch_dtype=torch_dtype, attn_implementation="eager", trust_remote_code=True)
             if args["precision"] == "bf16":
                 model.to(torch_dtype)
 
