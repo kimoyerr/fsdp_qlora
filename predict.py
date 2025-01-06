@@ -131,7 +131,6 @@ torch_dtype, compute_dtype = torch.bfloat16, torch.bfloat16
 # Load the LoraConfig 
 if lora_config.task_type == TaskType.CAUSAL_LM:
     base_model = AutoModelForCausalLM.from_pretrained(
-base_model = AutoModelForCausalLM.from_pretrained(
                     lora_config.base_model_name_or_path,
                     use_cache=False,
                     torch_dtype=torch_dtype,
