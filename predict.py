@@ -113,12 +113,12 @@ def calc_likelihood_from_logits(model_inputs, logits):
 
 
 # Path to the safetensors file
-data_dir = "/home/ubuntu/Krishna-Llama-south-1/fsdp_qlora/data/CAPSD_Ogden_2019"
-ckpt_dir = "/home/ubuntu/Krishna-Llama-south-1/train_outputs/CAPSD_Ogden_2019"
-dataset_name = "CAPSD_Ogden_2019"
-epoch = 3
-batch_size = 96
-test_dataset_name = "test_medium"
+data_dir = "/home/jupyter/Capsid/data/AAV5_VR4"
+ckpt_dir = "/home/jupyter/train_outputs/AAV5_VR4/"
+dataset_name = "AV5-VR4-test"
+epoch = 0
+batch_size = 48
+test_dataset_name = "test_small"
 
 safetensors_file = os.path.join(ckpt_dir, f"model_state_dict_epoch_{epoch}.safetensors")
 lora_config = LoraConfig.from_pretrained(ckpt_dir)
@@ -131,6 +131,7 @@ torch_dtype, compute_dtype = torch.bfloat16, torch.bfloat16
 # Load the LoraConfig 
 if lora_config.task_type == TaskType.CAUSAL_LM:
     base_model = AutoModelForCausalLM.from_pretrained(
+base_model = AutoModelForCausalLM.from_pretrained(
                     lora_config.base_model_name_or_path,
                     use_cache=False,
                     torch_dtype=torch_dtype,
@@ -162,9 +163,7 @@ missing_keys, unexpected_keys =  peft_model.load_state_dict(state_dict, strict=F
 # Dataloader
 test_df= pd.read_csv(os.path.join(data_dir, f"{test_dataset_name}.csv"))
 wt_path = os.path.join(data_dir, "wt.fasta")
-    
-
-testset = Mutation_Set(wt_path, data=test_df, fname=dataset_name,  tokenizer=tokenizer)
+testset = Mutation_Set(wt_path, data=test_df, fname=test_dataset_name,  tokenizer=tokenizer)
 testloader = DataLoader(testset, batch_size=batch_size, collate_fn=testset.collate_fn, shuffle=False)
 
 # Use for predictions
