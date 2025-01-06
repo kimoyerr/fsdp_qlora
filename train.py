@@ -677,7 +677,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         raise ValueError("Invalid precision")
 
 
-    # Load tokenizer
+    # Load et
     tokenizer = AutoTokenizer.from_pretrained(args["model_name"], trust_remote_code=True)
     tokenizer.pad_token_id = tokenizer.eos_token_id # TODO check if it exists first
 
