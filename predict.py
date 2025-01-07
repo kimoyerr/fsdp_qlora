@@ -115,10 +115,13 @@ def calc_likelihood_from_logits(model_inputs, logits):
 # Path to the safetensors file
 data_dir = "/home/jupyter/Capsid/data/AAV5_VR4"
 ckpt_dir = "/home/jupyter/train_outputs/AAV5_VR4/"
-dataset_name = "AV5-VR4-test"
+dataset_name = "AV5_VR4"
+# data_dir = "/home/jupyter/fsdp_qlora/data/CAPSD_Ogden_2019"
+# ckpt_dir = "/home/jupyter/train_outputs/CAPSD_Ogden_2019/"
+# dataset_name = "CAPSD_Ogden_test"
 epoch = 0
 batch_size = 48
-test_dataset_name = "test_small"
+test_dataset_name = "test_medium"
 
 safetensors_file = os.path.join(ckpt_dir, f"model_state_dict_epoch_{epoch}.safetensors")
 lora_config = LoraConfig.from_pretrained(ckpt_dir)
